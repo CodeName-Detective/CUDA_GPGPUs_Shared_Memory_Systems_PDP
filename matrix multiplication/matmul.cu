@@ -5,6 +5,8 @@
 #include <random>
 #include <chrono>
 
+#define TILE_WIDTH 32
+
 void error_check(cudaError_t& err, int line_no, const char* file_name){
     if (err!=cudaSuccess) {
         std::cout<<cudaGetErrorString(err)<<" at line "<<line_no<<" in file "<<file_name<<std::endl;
@@ -17,7 +19,7 @@ __global__ void matmul_kernel(float* M1, float* M2, float* M_Out,  unsigned int 
     int row = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (row<left_dim && col<right_dim){
-        float inner_product = 0.0;
+        float inner_product = 0.0f;
         for(int i=0; i<inner_dim; ++i){
             inner_product += M1[row*inner_dim+i]*M2[i*right_dim+col];
         }
@@ -53,6 +55,50 @@ __global__ void matmul_kernel_col(float* M1, float* M2, float* M_Out,  unsigned 
     }
 }
 
+__global__ void matmul_kernel_tiled(float* M1, float* M2, float* M_Out,  unsigned int left_dim, unsigned int inner_dim, unsigned int right_dim){
+
+    // Creating Buffers in shared memory to store data.
+    __shared__ float M1s[TILE_WIDTH][TILE_WIDTH];
+    __shared__ float M2s[TILE_WIDTH][TILE_WIDTH];
+
+    // We can also use TILE_WIDTH instead of blockDim as both are same.
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Loop Over THe Phases
+    float inner_product=0.0f;
+    for(int phase=0; phase<(inner_dim+TILE_WIDTH-1)/TILE_WIDTH; ++phase){
+
+        // Loading Data into shared memory.
+        //Load M1s - Handling Boundary Conditions
+        if(row<left_dim && (phase*TILE_WIDTH+threadIdx.x)<inner_dim){
+            M1s[threadIdx.y][threadIdx.x] = M1[(row*inner_dim)+(phase*TILE_WIDTH+threadIdx.x)];
+        }
+        else{
+            M1s[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+        //Load M2s - Handling Boundary Conditions
+        if((phase*TILE_WIDTH+threadIdx.y)<inner_dim && col<right_dim){
+            M2s[threadIdx.y][threadIdx.x] = M2[((phase*TILE_WIDTH+threadIdx.y)*right_dim)+(col)];
+        }
+        else{
+            M2s[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+        __syncthreads(); //Synchronization
+
+        // Performing Inner Product in 1 Phase for the Tile Loaded in Shared memory
+        for(int i=0; i<TILE_WIDTH; ++i){
+            inner_product += M1s[threadIdx.y][i]*M2s[i][threadIdx.x];
+        }
+        __syncthreads(); //Synchronization
+    }
+    //  Handling Boundary Conditions
+    if(row<left_dim && col<right_dim){
+        M_Out[row*right_dim+col] = inner_product;
+    }
+}
+
+
 void matmul(float* M1_h, float* M2_h, float* M_Out_h, unsigned int& left_dim, unsigned int& inner_dim, unsigned int& right_dim){
     float *M1_d, *M2_d, *M_Out_d;
     unsigned int m1_size = left_dim*inner_dim*sizeof(float), m2_size=inner_dim*right_dim*sizeof(float), m_out_size=left_dim*right_dim*sizeof(float);
@@ -74,9 +120,18 @@ void matmul(float* M1_h, float* M2_h, float* M_Out_h, unsigned int& left_dim, un
     error_check(err, __LINE__, __FILE__);
 
     // Calling Kernel
-    dim3 dimBlock(32, 32);
+    /*dim3 dimBlock(32, 32);
     dim3 dimGrid((int)std::ceil(right_dim/32.0), (int)std::ceil(left_dim/32.0));
-    matmul_kernel<<<dimGrid, dimBlock>>>(M1_d, M2_d, M_Out_d, left_dim, inner_dim, right_dim);
+    matmul_kernel<<<dimGrid, dimBlock>>>(M1_d, M2_d, M_Out_d, left_dim, inner_dim, right_dim);*/
+
+    /*matmul_kernel_row<<<(int)std::ceil(left_dim/256.0f), 256>>>(M1_d, M2_d, M_Out_d, left_dim, inner_dim, right_dim); */
+
+    /*matmul_kernel_col<<<(int)std::ceil(right_dim/256.0f), 256>>>(M1_d, M2_d, M_Out_d, left_dim, inner_dim, right_dim);*/
+
+    dim3 dimBlock(TILE_WIDTH, TILE_WIDTH);
+    dim3 dimGrid((int)std::ceil(right_dim/TILE_WIDTH), (int)std::ceil(left_dim/TILE_WIDTH));
+    matmul_kernel_tiled<<<dimGrid, dimBlock>>>(M1_d, M2_d, M_Out_d, left_dim, inner_dim, right_dim);
+
     err = cudaGetLastError();
     error_check(err, __LINE__, __FILE__);
 
